@@ -16,8 +16,15 @@ SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# Pays autorisés : Europe de l'Ouest
+# Pays autorisés : France + Europe de l'Ouest
 ALLOWED_COUNTRIES = {"FR", "BE", "NL", "LU", "ES", "IT", "PT", "DE", "AT"}
+
+# Mappage des ID de pays Vinted
+COUNTRY_ID_TO_ISO = {
+    16: "FR", 14: "BE", 7: "ES", 13: "IT", 22: "NL",
+    20: "PT", 15: "LU", 21: "DE", 2: "AT", 12: "PL",
+    1: "US", 3: "UK"
+}
 
 SEARCHES = [
     "rtx 3070", "rtx 3070 ti", "rtx 3080", "rtx 3080 ti",
@@ -146,34 +153,68 @@ def passes_basic_filters(item, max_price):
     return True
 
 
-def get_country_from_item(item):
-    # 1. Vérifier si le pays est dans l'objet utilisateur
-    user = item.get("user") or {}
-    country_code = user.get("country_code") or user.get("country_iso_code")
-    if country_code:
-        return country_code.upper()
+def extract_country_code(data):
+    if not isinstance(data, dict):
+        return None
+    for key in ["country_code", "country_iso_code", "iso_code"]:
+        val = data.get(key)
+        if isinstance(val, str) and len(val) == 2:
+            return val.upper()
+    country_obj = data.get("country")
+    if isinstance(country_obj, dict):
+        c = extract_country_code(country_obj)
+        if c:
+            return c
+    cid = data.get("country_id") or (country_obj.get("id") if isinstance(country_obj, dict) else None)
+    if cid is not None:
+        try:
+            cid_int = int(cid)
+            if cid_int in COUNTRY_ID_TO_ISO:
+                return COUNTRY_ID_TO_ISO[cid_int]
+        except Exception:
+            pass
+    return None
 
-    # 2. Extraction via l'URL de l'annonce
-    url = url_of(item).lower()
-    if ".vinted.fr" in url:
-        return "FR"
-    elif ".vinted.be" in url:
-        return "BE"
-    elif ".vinted.es" in url:
-        return "ES"
-    elif ".vinted.it" in url:
-        return "IT"
-    elif ".vinted.de" in url:
-        return "DE"
-    elif ".vinted.nl" in url:
-        return "NL"
-    elif ".vinted.pt" in url:
-        return "PT"
-    elif ".vinted.at" in url:
-        return "AT"
-    
-    # 3. Par défaut, si la recherche a été faite sur vinted.fr
-    return "FR"
+
+def seller_country(session, item, headers):
+    # 1. Analyse des données JSON de la recherche
+    c = extract_country_code(item) or extract_country_code(item.get("user"))
+    if c:
+        return c
+
+    item_id = str(item.get("id"))
+
+    # 2. Requête spécifique sur l'API Vinted v2 de l'annonce
+    try:
+        r = session.get(f"{WWW}/api/v2/items/{item_id}", headers=headers, timeout=5)
+        if r.status_code == 200:
+            item_data = r.json().get("item", {})
+            c = extract_country_code(item_data) or extract_country_code(item_data.get("user"))
+            if c:
+                return c
+    except Exception:
+        pass
+
+    # 3. Scraping HTML de secours
+    item_url = url_of(item)
+    try:
+        r = session.get(item_url, timeout=5)
+        if r.status_code == 200:
+            html = r.text
+            m = re.search(r'"country_code"\s*:\s*"([A-Z]{2})"', html, re.I)
+            if m:
+                return m.group(1).upper()
+            m = re.search(r'"country_iso_code"\s*:\s*"([A-Z]{2})"', html, re.I)
+            if m:
+                return m.group(1).upper()
+            m = re.search(r'"country_id"\s*:\s*(\d+)', html)
+            if m and int(m.group(1)) in COUNTRY_ID_TO_ISO:
+                return COUNTRY_ID_TO_ISO[int(m.group(1))]
+    except Exception:
+        pass
+
+    # Si la moindre incertitude subsiste, on renvoie None (pas de valeur par défaut FR)
+    return None
 
 
 s = cr.Session(impersonate="chrome")
@@ -243,20 +284,22 @@ for query in SEARCHES:
 
     time.sleep(random.uniform(1, 2))
 
-print(f"🕵️ {len(candidates)} annonce(s) candidate(s), filtrage du pays...")
+print(f"🕵️ {len(candidates)} annonce(s) candidate(s), vérification du pays du vendeur...")
 
 to_send = []
 for ad, label, max_price in candidates:
     ad_id = str(ad.get("id"))
-    country = get_country_from_item(ad)
-    print(f"   → annonce {ad_id} ({label}) : pays = {country}")
+    country = seller_country(s, ad, headers)
+    print(f"   → annonce {ad_id} ({label}) : pays détecté = {country}")
 
-    if country not in ALLOWED_COUNTRIES:
-        print(f"   🚫 Ignorée (Pays {country} hors Europe de l'Ouest)")
+    # Si pays inconnu ou en dehors de l'Europe de l'Ouest -> On rejette
+    if not country or country not in ALLOWED_COUNTRIES:
+        print(f"   🚫 Annonce refusée (Pays: {country})")
         seen.add(ad_id)
         continue
 
     to_send.append((ad, label, max_price, country))
+    time.sleep(random.uniform(0.3, 0.7))
 
 print(f"📲 {len(to_send)} annonce(s) à envoyer.")
 
