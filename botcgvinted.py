@@ -16,10 +16,10 @@ SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# Pays acceptés (France + Europe de l'Ouest proche)
+# Pays autorisés : France + Europe de l'Ouest
 ALLOWED_COUNTRIES = {"FR", "BE", "NL", "LU", "ES", "IT", "PT", "DE", "AT"}
 
-# Mappage des identifiants de pays Vinted vers le code ISO
+# Mappage des ID de pays Vinted
 COUNTRY_ID_TO_ISO = {
     16: "FR", 14: "BE", 7: "ES", 13: "IT", 22: "NL",
     20: "PT", 15: "LU", 21: "DE", 2: "AT", 12: "PL",
@@ -177,16 +177,16 @@ def extract_country_code(data):
 
 
 def seller_country(session, item, headers):
-    # 1. Vérifier dans la réponse de recherche initiale
+    # 1. Analyse des données JSON de la recherche
     c = extract_country_code(item) or extract_country_code(item.get("user"))
     if c:
         return c
 
     item_id = str(item.get("id"))
 
-    # 2. Interroger l'API spécifique Vinted v2
+    # 2. Requête spécifique sur l'API Vinted v2 de l'annonce
     try:
-        r = session.get(f"{WWW}/api/v2/items/{item_id}", headers=headers, timeout=10)
+        r = session.get(f"{WWW}/api/v2/items/{item_id}", headers=headers, timeout=5)
         if r.status_code == 200:
             item_data = r.json().get("item", {})
             c = extract_country_code(item_data) or extract_country_code(item_data.get("user"))
@@ -195,10 +195,10 @@ def seller_country(session, item, headers):
     except Exception:
         pass
 
-    # 3. Fallback : Scraper la page Web HTML
+    # 3. Scraping HTML de secours
     item_url = url_of(item)
     try:
-        r = session.get(item_url, timeout=10)
+        r = session.get(item_url, timeout=5)
         if r.status_code == 200:
             html = r.text
             m = re.search(r'"country_code"\s*:\s*"([A-Z]{2})"', html, re.I)
@@ -213,8 +213,8 @@ def seller_country(session, item, headers):
     except Exception:
         pass
 
-    # Défaut FR si l'information reste masquée
-    return "FR"
+    # Si la moindre incertitude subsiste, on renvoie None (pas de valeur par défaut FR)
+    return None
 
 
 s = cr.Session(impersonate="chrome")
@@ -292,8 +292,9 @@ for ad, label, max_price in candidates:
     country = seller_country(s, ad, headers)
     print(f"   → annonce {ad_id} ({label}) : pays détecté = {country}")
 
-    if country not in ALLOWED_COUNTRIES:
-        print(f"   🚫 Annonce ignorée (Pays {country} hors zone)")
+    # Si pays inconnu ou en dehors de l'Europe de l'Ouest -> On rejette
+    if not country or country not in ALLOWED_COUNTRIES:
+        print(f"   🚫 Annonce refusée (Pays: {country})")
         seen.add(ad_id)
         continue
 
