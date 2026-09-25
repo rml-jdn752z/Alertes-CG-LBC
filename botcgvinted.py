@@ -5,7 +5,7 @@ import requests
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-print("--- DÉMARRAGE DU BOT VINTED CARTES GRAPHIQUES (EUROPE / FR ONLY) ---")
+print("--- DÉMARRAGE DU BOT VINTED CARTES GRAPHIQUES ---")
 if not TOKEN or not CHAT:
     print("❌ Secrets manquants : vérifie TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID.")
     raise SystemExit(1)
@@ -16,10 +16,9 @@ SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# IDs des pays européens autorisés sur Vinted :
+# IDs Vinted stricts pour Europe de l'Ouest
 # 16: FR, 14: BE, 7: ES, 13: IT, 22: NL, 20: PT, 15: LU, 21: DE, 2: AT
-EUROPE_COUNTRY_IDS = "16,14,7,13,22,20,15,21,2"
-
+ALLOWED_COUNTRY_IDS = {16, 14, 7, 13, 22, 20, 15, 21, 2}
 COUNTRY_ID_MAP = {
     16: "FR", 14: "BE", 7: "ES", 13: "IT", 22: "NL",
     20: "PT", 15: "LU", 21: "DE", 2: "AT"
@@ -151,28 +150,29 @@ def passes_basic_filters(item, max_price):
     return True
 
 
-def get_country_code(item):
-    # Récupération via les données utilisateur Vinted
+def extract_country_id(item):
+    # Cherche l'ID du pays dans la structure JSON de Vinted
     user = item.get("user") or {}
     cid = user.get("country_id") or item.get("country_id")
-    if cid and int(cid) in COUNTRY_ID_MAP:
-        return COUNTRY_ID_MAP[int(cid)]
-    return "FR"
+    if cid is not None:
+        try:
+            return int(cid)
+        except Exception:
+            pass
+    return None
 
 
 s = cr.Session(impersonate="chrome")
-s.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Accept": "application/json, text/plain, */*",
-})
+s.headers.update({"Accept-Language": "fr-FR,fr;q=0.9"})
 
+# Initialisation de la session pour choper les cookies Vinted FR
 home = s.get(WWW, timeout=25)
+print(f"Connexion Vinted : statut {home.status_code}")
 
 token = s.cookies.get("access_token_web")
 anon = home.headers.get("x-anon-id") or home.headers.get("X-Anon-Id")
 
-headers = {}
+headers = {"Accept": "application/json, text/plain, */*"}
 if token:
     headers["Authorization"] = f"Bearer {token}"
 if anon:
@@ -181,7 +181,7 @@ if anon:
 try:
     with open(SEEN_FILE, "r") as f:
         seen = set(json.load(f))
-    print(f"📁 {len(seen)} annonces déjà enregistrées")
+    print(f"📁 {len(seen)} annonces en mémoire")
 except Exception:
     seen = set()
 
@@ -190,7 +190,6 @@ to_send = []
 
 for query in SEARCHES:
     try:
-        # Envoi strict de country_ids à l'API pour bannir les US
         r = s.get(
             API,
             params={
@@ -200,15 +199,17 @@ for query in SEARCHES:
                 "order": "newest_first",
                 "per_page": "50",
                 "page": "1",
-                "country_ids": EUROPE_COUNTRY_IDS,
             },
             headers=headers,
             timeout=25,
         )
-        ads = r.json().get("items") or [] if r.status_code == 200 else []
+        status = r.status_code
+        ads = r.json().get("items") or [] if status == 200 else []
     except Exception as e:
-        print(f"❌ Erreur '{query}' :", e)
-        ads = []
+        print(f"❌ Erreur sur '{query}' :", e)
+        status, ads = None, []
+
+    print(f"🔍 '{query}' : statut {status}, {len(ads)} annonces reçues")
 
     for ad in ads:
         ad_id = str(ad.get("id"))
@@ -222,15 +223,25 @@ for query in SEARCHES:
 
         label, max_price = match
         if passes_basic_filters(ad, max_price):
-            country = get_country_code(ad)
-            to_send.append((ad, label, max_price, country))
+            cid = extract_country_id(ad)
+            
+            # FILTRAGE STRICT : Si l'ID du pays n'est PAS dans la liste Europe/FR (ex: US = 1), ON JETTE.
+            if cid not in ALLOWED_COUNTRY_IDS:
+                print(f"   🚫 Annonce {ad_id} ignorée (Country ID: {cid} - Hors Europe)")
+                seen.add(ad_id)
+                continue
 
-    time.sleep(random.uniform(0.5, 1.2))
+            country_code = COUNTRY_ID_MAP.get(cid, "EU")
+            to_send.append((ad, label, max_price, country_code))
+        else:
+            seen.add(ad_id)
 
-print(f"📲 {len(to_send)} nouvelle(s) annonce(s) Europe/FR à envoyer.")
+    time.sleep(random.uniform(1, 2))
+
+print(f"📲 {len(to_send)} annonce(s) valide(s) Europe/FR à envoyer.")
 
 if first_run and to_send:
-    tg(f"✅ Bot Filtre Europe/FR initialisé. {len(to_send)} annonces détectées.")
+    tg(f"✅ Bot Vinted actif. {len(to_send)} annonces détectées.")
 
 sent = 0
 for ad, label, max_price, country in to_send:
@@ -241,17 +252,17 @@ for ad, label, max_price, country in to_send:
 
     msg = (
         f"🎮 [{label}]\n{title}\n"
-        f"💶 {p if p is not None else '?'} € (Max {max_price} €)\n"
-        f"❤️ {favs} favs | 🌍 {country}\n"
+        f"💶 {p if p is not None else '?'} € (max {max_price} €)\n"
+        f"❤️ {favs} favoris  🌍 {country}\n"
         f"{url_of(ad)}"
     )
 
     if tg(msg):
         seen.add(ad_id)
         sent += 1
-        time.sleep(random.uniform(0.8, 1.2))
+        time.sleep(random.uniform(0.8, 1.3))
 
 with open(SEEN_FILE, "w") as f:
     json.dump(sorted(seen), f)
 
-print(f"--- Envois terminés : {sent} notifications Telegram ---")
+print(f"--- FIN : {sent} notification(s) envoyée(s) ---")
