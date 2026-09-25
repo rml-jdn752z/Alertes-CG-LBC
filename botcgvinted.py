@@ -5,25 +5,24 @@ import requests
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-print("--- DÉMARRAGE DU BOT VINTED CARTES GRAPHIQUES ---")
+print("--- DÉMARRAGE DU BOT VINTED CARTES GRAPHIQUES (EUROPE / FR ONLY) ---")
 if not TOKEN or not CHAT:
     print("❌ Secrets manquants : vérifie TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID.")
     raise SystemExit(1)
 
 WWW = "https://www.vinted.fr"
-API = "https://api.vinted.fr/svc-catalogue/items"
+API = "https://www.vinted.fr/api/v2/catalog/items"
 SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# Pays autorisés : France + Europe de l'Ouest
-ALLOWED_COUNTRIES = {"FR", "BE", "NL", "LU", "ES", "IT", "PT", "DE", "AT"}
+# IDs des pays européens autorisés sur Vinted :
+# 16: FR, 14: BE, 7: ES, 13: IT, 22: NL, 20: PT, 15: LU, 21: DE, 2: AT
+EUROPE_COUNTRY_IDS = "16,14,7,13,22,20,15,21,2"
 
-# Mappage des ID de pays Vinted
-COUNTRY_ID_TO_ISO = {
+COUNTRY_ID_MAP = {
     16: "FR", 14: "BE", 7: "ES", 13: "IT", 22: "NL",
-    20: "PT", 15: "LU", 21: "DE", 2: "AT", 12: "PL",
-    1: "US", 3: "UK"
+    20: "PT", 15: "LU", 21: "DE", 2: "AT"
 }
 
 SEARCHES = [
@@ -86,7 +85,6 @@ def tg(text):
             data={"chat_id": CHAT, "text": text},
             timeout=20,
         )
-        print("Telegram :", r.status_code, r.text[:150])
         return r.status_code == 200
     except Exception as e:
         print("Telegram erreur :", e)
@@ -153,79 +151,28 @@ def passes_basic_filters(item, max_price):
     return True
 
 
-def extract_country_code(data):
-    if not isinstance(data, dict):
-        return None
-    for key in ["country_code", "country_iso_code", "iso_code"]:
-        val = data.get(key)
-        if isinstance(val, str) and len(val) == 2:
-            return val.upper()
-    country_obj = data.get("country")
-    if isinstance(country_obj, dict):
-        c = extract_country_code(country_obj)
-        if c:
-            return c
-    cid = data.get("country_id") or (country_obj.get("id") if isinstance(country_obj, dict) else None)
-    if cid is not None:
-        try:
-            cid_int = int(cid)
-            if cid_int in COUNTRY_ID_TO_ISO:
-                return COUNTRY_ID_TO_ISO[cid_int]
-        except Exception:
-            pass
-    return None
-
-
-def seller_country(session, item, headers):
-    # 1. Analyse des données JSON de la recherche
-    c = extract_country_code(item) or extract_country_code(item.get("user"))
-    if c:
-        return c
-
-    item_id = str(item.get("id"))
-
-    # 2. Requête spécifique sur l'API Vinted v2 de l'annonce
-    try:
-        r = session.get(f"{WWW}/api/v2/items/{item_id}", headers=headers, timeout=5)
-        if r.status_code == 200:
-            item_data = r.json().get("item", {})
-            c = extract_country_code(item_data) or extract_country_code(item_data.get("user"))
-            if c:
-                return c
-    except Exception:
-        pass
-
-    # 3. Scraping HTML de secours
-    item_url = url_of(item)
-    try:
-        r = session.get(item_url, timeout=5)
-        if r.status_code == 200:
-            html = r.text
-            m = re.search(r'"country_code"\s*:\s*"([A-Z]{2})"', html, re.I)
-            if m:
-                return m.group(1).upper()
-            m = re.search(r'"country_iso_code"\s*:\s*"([A-Z]{2})"', html, re.I)
-            if m:
-                return m.group(1).upper()
-            m = re.search(r'"country_id"\s*:\s*(\d+)', html)
-            if m and int(m.group(1)) in COUNTRY_ID_TO_ISO:
-                return COUNTRY_ID_TO_ISO[int(m.group(1))]
-    except Exception:
-        pass
-
-    # Si la moindre incertitude subsiste, on renvoie None (pas de valeur par défaut FR)
-    return None
+def get_country_code(item):
+    # Récupération via les données utilisateur Vinted
+    user = item.get("user") or {}
+    cid = user.get("country_id") or item.get("country_id")
+    if cid and int(cid) in COUNTRY_ID_MAP:
+        return COUNTRY_ID_MAP[int(cid)]
+    return "FR"
 
 
 s = cr.Session(impersonate="chrome")
-s.headers.update({"Accept-Language": "fr-FR,fr;q=0.9"})
+s.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Accept": "application/json, text/plain, */*",
+})
+
 home = s.get(WWW, timeout=25)
-print("Accueil Vinted :", home.status_code)
 
 token = s.cookies.get("access_token_web")
 anon = home.headers.get("x-anon-id") or home.headers.get("X-Anon-Id")
 
-headers = {"Accept": "application/json, text/plain, */*"}
+headers = {}
 if token:
     headers["Authorization"] = f"Bearer {token}"
 if anon:
@@ -234,16 +181,16 @@ if anon:
 try:
     with open(SEEN_FILE, "r") as f:
         seen = set(json.load(f))
-    print(f"📁 {len(seen)} annonces déjà en mémoire")
+    print(f"📁 {len(seen)} annonces déjà enregistrées")
 except Exception:
     seen = set()
-    print("📁 Aucun historique trouvé, on part de zéro.")
 
 first_run = len(seen) == 0
-candidates = []
+to_send = []
 
 for query in SEARCHES:
     try:
+        # Envoi strict de country_ids à l'API pour bannir les US
         r = s.get(
             API,
             params={
@@ -253,18 +200,15 @@ for query in SEARCHES:
                 "order": "newest_first",
                 "per_page": "50",
                 "page": "1",
-                "time": str(int(time.time())),
+                "country_ids": EUROPE_COUNTRY_IDS,
             },
             headers=headers,
             timeout=25,
         )
-        status = r.status_code
-        ads = r.json().get("items") or [] if status == 200 else []
+        ads = r.json().get("items") or [] if r.status_code == 200 else []
     except Exception as e:
-        print(f"❌ Erreur sur '{query}' :", e)
-        status, ads = None, []
-
-    print(f"🔍 '{query}' : statut {status}, {len(ads)} annonces reçues")
+        print(f"❌ Erreur '{query}' :", e)
+        ads = []
 
     for ad in ads:
         ad_id = str(ad.get("id"))
@@ -278,33 +222,15 @@ for query in SEARCHES:
 
         label, max_price = match
         if passes_basic_filters(ad, max_price):
-            candidates.append((ad, label, max_price))
-        else:
-            seen.add(ad_id)
+            country = get_country_code(ad)
+            to_send.append((ad, label, max_price, country))
 
-    time.sleep(random.uniform(1, 2))
+    time.sleep(random.uniform(0.5, 1.2))
 
-print(f"🕵️ {len(candidates)} annonce(s) candidate(s), vérification du pays du vendeur...")
-
-to_send = []
-for ad, label, max_price in candidates:
-    ad_id = str(ad.get("id"))
-    country = seller_country(s, ad, headers)
-    print(f"   → annonce {ad_id} ({label}) : pays détecté = {country}")
-
-    # Si pays inconnu ou en dehors de l'Europe de l'Ouest -> On rejette
-    if not country or country not in ALLOWED_COUNTRIES:
-        print(f"   🚫 Annonce refusée (Pays: {country})")
-        seen.add(ad_id)
-        continue
-
-    to_send.append((ad, label, max_price, country))
-    time.sleep(random.uniform(0.3, 0.7))
-
-print(f"📲 {len(to_send)} annonce(s) à envoyer.")
+print(f"📲 {len(to_send)} nouvelle(s) annonce(s) Europe/FR à envoyer.")
 
 if first_run and to_send:
-    tg(f"✅ Bot Cartes Graphiques Vinted actif. {len(to_send)} annonces trouvées, envoi en cours.")
+    tg(f"✅ Bot Filtre Europe/FR initialisé. {len(to_send)} annonces détectées.")
 
 sent = 0
 for ad, label, max_price, country in to_send:
@@ -315,17 +241,17 @@ for ad, label, max_price, country in to_send:
 
     msg = (
         f"🎮 [{label}]\n{title}\n"
-        f"💶 {p if p is not None else '?'} € (max {max_price} €)\n"
-        f"❤️ {favs} favoris  🌍 {country}\n"
+        f"💶 {p if p is not None else '?'} € (Max {max_price} €)\n"
+        f"❤️ {favs} favs | 🌍 {country}\n"
         f"{url_of(ad)}"
     )
 
     if tg(msg):
         seen.add(ad_id)
         sent += 1
-        time.sleep(random.uniform(0.8, 1.3))
+        time.sleep(random.uniform(0.8, 1.2))
 
 with open(SEEN_FILE, "w") as f:
     json.dump(sorted(seen), f)
 
-print(f"--- FIN : {sent} notification(s) envoyée(s) sur {len(to_send)} ---")
+print(f"--- Envois terminés : {sent} notifications Telegram ---")
