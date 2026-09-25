@@ -1,4 +1,5 @@
 import os, re, json, time, random, requests
+from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
 TOKEN = os.environ.get("LBC_CG_BOT_TOKEN", "").strip()
@@ -11,9 +12,8 @@ if not TOKEN or not CHAT:
 
 SEEN_FILE = "seen_lbc_cg.json"
 MAX_FAV = 40
-REQUEST_PRICE_CEILING = 500  # plafond large côté recherche ; le vrai plafond est appliqué par modèle
+PRICE_CEILING = 500
 
-# Recherches Leboncoin (une par modèle ou famille)
 SEARCHES = [
     "rtx 3070", "rtx 3070 ti", "rtx 3080", "rtx 3080 ti",
     "rx 9060 xt", "rx 6800", "rx 6800 xt", "rx 7700 xt", "rx 7800 xt",
@@ -24,7 +24,6 @@ SEARCHES = [
     "rx 9070", "rx 9070 xt",
 ]
 
-# Modèle -> (nom affiché, prix max), du plus précis au plus général
 MODELS = [
     (r"rtx\s*3070\s*ti", "RTX 3070 Ti", 270),
     (r"rtx\s*3070", "RTX 3070", 270),
@@ -91,7 +90,7 @@ def classify(title, body):
     return None
 
 
-def is_ok(ad, label, max_price):
+def is_ok(ad, max_price):
     title = ad.get("subject") or ""
     body = ad.get("body") or ""
     text = f"{title} {body}".lower()
@@ -113,8 +112,8 @@ def is_ok(ad, label, max_price):
         return False
 
     price_list = ad.get("price") or []
-    price = price_list[0] if price_list else 0
-    if price <= 0 or price > max_price:
+    price = price_list[0] if price_list else ad.get("price_cents", 0) / 100 if ad.get("price_cents") else 0
+    if not price or price <= 0 or price > max_price:
         return False
 
     fav_count = ad.get("like_count") or ad.get("nb_likes") or 0
@@ -122,6 +121,38 @@ def is_ok(ad, label, max_price):
         return False
 
     return True
+
+
+def find_ads(node, results):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, list) and v and isinstance(v[0], dict) and "list_id" in v[0] and "subject" in v[0]:
+                results.extend(v)
+            else:
+                find_ads(v, results)
+    elif isinstance(node, list):
+        for item in node:
+            find_ads(item, results)
+
+
+def extract_ads_from_page(page):
+    try:
+        html = page.content()
+    except Exception:
+        return []
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return []
+    results = []
+    find_ads(data, results)
+    uniq = {}
+    for ad in results:
+        uniq[ad.get("list_id")] = ad
+    return list(uniq.values())
 
 
 try:
@@ -139,6 +170,7 @@ STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['fr-FR', 'fr']});
 Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+window.chrome = { runtime: {} };
 """
 
 with sync_playwright() as p:
@@ -149,60 +181,38 @@ with sync_playwright() as p:
     context = browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         locale="fr-FR",
-        viewport={"width": 1280, "height": 800},
+        viewport={"width": 1366, "height": 850},
+        extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"},
     )
     context.add_init_script(STEALTH_JS)
     page = context.new_page()
 
     try:
-        page.goto("https://www.leboncoin.fr", timeout=30000, wait_until="networkidle")
-        time.sleep(random.uniform(1.5, 3))
+        page.goto("https://www.leboncoin.fr", timeout=30000, wait_until="domcontentloaded")
+        time.sleep(random.uniform(2, 3.5))
+        for label in ["Accepter", "Accepter tout", "J'accepte"]:
+            try:
+                btn = page.get_by_text(label, exact=False).first
+                if btn.is_visible(timeout=1500):
+                    btn.click(timeout=1500)
+                    time.sleep(1)
+                    break
+            except Exception:
+                pass
     except Exception as e:
         print("⚠️ Erreur au chargement initial :", e)
 
     for query in SEARCHES:
-        payload = {
-            "limit": 35,
-            "filters": {
-                "keywords": {"text": query},
-                "price": {"max": REQUEST_PRICE_CEILING},
-                "enums": {"ad_type": ["offer"]},
-            },
-            "sort_by": "time",
-            "sort_order": "desc",
-        }
-
-        result = None
-        for attempt in range(2):
-            try:
-                result = page.evaluate(
-                    """
-                    async (payload) => {
-                        const res = await fetch('https://api.leboncoin.fr/finder/search', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'api_key': 'ba444675426c5002803ea272e1c7200c'
-                            },
-                            body: JSON.stringify(payload)
-                        });
-                        return {status: res.status, body: res.status === 200 ? await res.json() : null};
-                    }
-                    """,
-                    payload,
-                )
-                break
-            except Exception as e:
-                print(f"❌ Erreur réseau sur '{query}' (essai {attempt + 1}) :", e)
-                time.sleep(2)
-
-        if not result or result.get("status") != 200 or not result.get("body"):
-            print(f"⚠️ '{query}' : bloqué ou vide (statut {result.get('status') if result else '?'})")
-            time.sleep(random.uniform(0.8, 1.6))
-            continue
-
-        ads = result["body"].get("ads") or []
-        print(f"🔍 '{query}' : {len(ads)} annonces reçues")
+        url = f"https://www.leboncoin.fr/recherche?text={quote_plus(query)}&price=0-{PRICE_CEILING}&sort=time&order=desc"
+        try:
+            resp = page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            time.sleep(random.uniform(2, 3.5))
+            status = resp.status if resp else None
+            ads = extract_ads_from_page(page)
+            print(f"🔍 '{query}' : statut {status}, {len(ads)} annonces trouvées sur la page")
+        except Exception as e:
+            print(f"❌ Erreur sur '{query}' :", e)
+            ads = []
 
         for ad in ads:
             ad_id = str(ad.get("list_id"))
@@ -215,12 +225,12 @@ with sync_playwright() as p:
                 continue
 
             label, max_price = match
-            if is_ok(ad, label, max_price):
+            if is_ok(ad, max_price):
                 to_send.append((ad, label, max_price))
             else:
                 seen.add(ad_id)
 
-        time.sleep(random.uniform(0.8, 1.6))
+        time.sleep(random.uniform(1.5, 3))
 
     browser.close()
 
@@ -233,7 +243,8 @@ sent = 0
 for ad, label, max_price in to_send:
     ad_id = str(ad.get("list_id"))
     title = ad.get("subject", "Sans titre")
-    price = (ad.get("price") or [0])[0]
+    price_list = ad.get("price") or []
+    price = price_list[0] if price_list else (ad.get("price_cents", 0) / 100 if ad.get("price_cents") else "?")
     url = ad.get("url") or f"https://www.leboncoin.fr/ad/informatique/{ad_id}"
     location = (ad.get("location") or {}).get("city", "France")
     favs = ad.get("like_count") or ad.get("nb_likes") or 0
