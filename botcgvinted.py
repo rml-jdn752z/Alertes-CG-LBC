@@ -11,12 +11,12 @@ if not TOKEN or not CHAT:
     raise SystemExit(1)
 
 WWW = "https://www.vinted.fr"
-API = "https://www.vinted.fr/api/v2/catalog/items"
+API = "https://api.vinted.fr/svc-catalogue/items"
 SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# IDs Vinted stricts pour Europe de l'Ouest
+# Pays autorisés (IDs Vinted) :
 # 16: FR, 14: BE, 7: ES, 13: IT, 22: NL, 20: PT, 15: LU, 21: DE, 2: AT
 ALLOWED_COUNTRY_IDS = {16, 14, 7, 13, 22, 20, 15, 21, 2}
 COUNTRY_ID_MAP = {
@@ -151,9 +151,8 @@ def passes_basic_filters(item, max_price):
 
 
 def extract_country_id(item):
-    # Cherche l'ID du pays dans la structure JSON de Vinted
     user = item.get("user") or {}
-    cid = user.get("country_id") or item.get("country_id")
+    cid = user.get("country_id") or item.get("country_id") or user.get("country_id")
     if cid is not None:
         try:
             return int(cid)
@@ -165,7 +164,6 @@ def extract_country_id(item):
 s = cr.Session(impersonate="chrome")
 s.headers.update({"Accept-Language": "fr-FR,fr;q=0.9"})
 
-# Initialisation de la session pour choper les cookies Vinted FR
 home = s.get(WWW, timeout=25)
 print(f"Connexion Vinted : statut {home.status_code}")
 
@@ -225,9 +223,8 @@ for query in SEARCHES:
         if passes_basic_filters(ad, max_price):
             cid = extract_country_id(ad)
             
-            # FILTRAGE STRICT : Si l'ID du pays n'est PAS dans la liste Europe/FR (ex: US = 1), ON JETTE.
+            # Rejet immédiat si le pays n'est pas identifié ou hors Europe de l'Ouest
             if cid not in ALLOWED_COUNTRY_IDS:
-                print(f"   🚫 Annonce {ad_id} ignorée (Country ID: {cid} - Hors Europe)")
                 seen.add(ad_id)
                 continue
 
