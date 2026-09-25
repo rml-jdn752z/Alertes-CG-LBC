@@ -5,7 +5,7 @@ import requests
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-print("--- DÉMARRAGE DU BOT VINTED MATÉRIEL PC ---")
+print("--- DÉMARRAGE DU BOT VINTED HARDWARE ---")
 if not TOKEN or not CHAT:
     print("❌ Secrets manquants : vérifie TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID.")
     raise SystemExit(1)
@@ -16,14 +16,13 @@ SEEN_FILE = "seen_vinted_cg.json"
 MAX_FAV = 40
 PRICE_CEILING = 500
 
-# Pays autorisés (Europe de l'Ouest / FR)
+# IDs des pays autorisés (France + Europe de l'Ouest)
 ALLOWED_COUNTRY_IDS = {16, 14, 7, 13, 22, 20, 15, 21, 2}
 COUNTRY_ID_MAP = {
     16: "FR", 14: "BE", 7: "ES", 13: "IT", 22: "NL",
     20: "PT", 15: "LU", 21: "DE", 2: "AT"
 }
 
-# Termes de recherche envoyés à l'API
 SEARCHES = [
     # GPU
     "rtx 3070", "rtx 3070 ti", "rtx 3080", "rtx 3080 ti",
@@ -43,7 +42,6 @@ SEARCHES = [
     "a620m", "b650m", "watercooling 360", "watercooling 360mm"
 ]
 
-# Modèles, patterns de détection et plafonds de prix spécifiques
 MODELS = [
     # --- GPU ---
     (r"rtx\s*3070\s*ti", "RTX 3070 Ti", 270),
@@ -158,7 +156,7 @@ def passes_basic_filters(item, max_price):
     text = (item.get("title", "") + " " + (item.get("description") or "")).lower()
     padded = " " + text.replace(",", " ").replace(".", " ") + " "
     
-    # Exclude HS / Mots interdits
+    # Filtre mots interdits / HS
     for w in BAD_WORDS:
         if w == "hs":
             if " hs " in padded:
@@ -166,7 +164,7 @@ def passes_basic_filters(item, max_price):
         elif w in text:
             return False
 
-    # Exclusion systématique des boîtes seules / boîtes vides
+    # Filtre boîtes seules
     if any(b in text for b in ["boite seule", "boite uniquement", "boite vide", "boite de", "boite du", "boite d'", "boîte seule", "boîte uniquement", "boîte vide"]) \
             and not any(k in text for k in ["avec boite", "avec la boite", "dans sa boite", "avec sa boite", "avec boîte", "dans sa boîte"]):
         return False
@@ -176,20 +174,30 @@ def passes_basic_filters(item, max_price):
     if p is None or p <= 0 or p > max_price:
         return False
 
-    # Ignore si > 40 favoris
+    # Max 40 favoris
     if favs_of(item) > MAX_FAV:
         return False
 
     return True
 
-def extract_country_id(item):
+def extract_country(item):
+    # Récupération sécurisée du pays
     user = item.get("user") or {}
     cid = user.get("country_id") or item.get("country_id")
     if cid is not None:
         try:
-            return int(cid)
+            cid = int(cid)
+            if cid in ALLOWED_COUNTRY_IDS:
+                return COUNTRY_ID_MAP.get(cid, "EU")
+            else:
+                return None # Pays explicitement interdit (ex: US = 1)
         except Exception:
             pass
+    
+    # Si pas d'ID explicite, on vérifie la monnaie/domaine (EUR = Europe)
+    currency = item.get("currency") or item.get("price", {}).get("currency_code")
+    if currency == "EUR":
+        return "EU"
     return None
 
 s = cr.Session(impersonate="chrome")
@@ -252,24 +260,19 @@ for query in SEARCHES:
 
         label, max_price = match
         if passes_basic_filters(ad, max_price):
-            cid = extract_country_id(ad)
+            country_code = extract_country(ad)
             
-            # Rejet si hors Europe / FR
-            if cid not in ALLOWED_COUNTRY_IDS:
+            if not country_code:
                 seen.add(ad_id)
                 continue
 
-            country_code = COUNTRY_ID_MAP.get(cid, "EU")
             to_send.append((ad, label, max_price, country_code))
         else:
             seen.add(ad_id)
 
-    time.sleep(random.uniform(1, 1.5))
+    time.sleep(random.uniform(0.5, 1.0))
 
-print(f"📲 {len(to_send)} annonce(s) valide(s) Europe/FR à envoyer.")
-
-if first_run and to_send:
-    tg(f"✅ Bot Vinted Hardware actif. {len(to_send)} offres détectées.")
+print(f"📲 {len(to_send)} annonce(s) valide(s) à envoyer.")
 
 sent = 0
 for ad, label, max_price, country in to_send:
