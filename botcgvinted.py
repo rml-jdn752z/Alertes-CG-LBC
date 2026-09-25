@@ -18,11 +18,6 @@ PRICE_CEILING = 500
 
 # Pays acceptés : France + Europe de l'Ouest proche
 ALLOWED_COUNTRIES = {"FR", "BE", "NL", "LU", "ES", "IT", "PT", "IE", "DE"}
-DOMAIN_TO_COUNTRY = {
-    "be": "BE", "nl": "NL", "lu": "LU", "es": "ES", "it": "IT",
-    "pt": "PT", "ie": "IE", "de": "DE", "at": "AT", "pl": "PL",
-    "cz": "CZ", "lt": "LT", "co.uk": "GB", "com": "US",
-}
 
 SEARCHES = [
     "rtx 3070", "rtx 3070 ti", "rtx 3080", "rtx 3080 ti",
@@ -119,22 +114,6 @@ def favs_of(item):
         return 0
 
 
-def country_of(item):
-    user = item.get("user")
-    sources = [user, item] if isinstance(user, dict) else [item]
-    for src in sources:
-        for k in ("country_iso_code", "country_code", "countryCode", "country"):
-            v = src.get(k)
-            if isinstance(v, dict):
-                v = v.get("iso_code") or v.get("code")
-            if isinstance(v, str) and len(v.strip()) == 2:
-                return v.strip().upper()
-    m = re.search(r"vinted\.([a-z.]+)/", item.get("url") or "")
-    if m and m.group(1) != "fr":
-        return DOMAIN_TO_COUNTRY.get(m.group(1))
-    return None
-
-
 def classify(title, body):
     text = f"{title} {body}".lower()
     for pattern, label, max_price in MODELS:
@@ -143,7 +122,7 @@ def classify(title, body):
     return None
 
 
-def is_ok(item, max_price):
+def passes_basic_filters(item, max_price):
     text = (item.get("title", "") + " " + (item.get("description") or "")).lower()
     padded = " " + text.replace(",", " ").replace(".", " ") + " "
     for w in BAD_WORDS:
@@ -164,11 +143,27 @@ def is_ok(item, max_price):
     if favs_of(item) > MAX_FAV:
         return False
 
-    c = country_of(item)
-    if c is not None and c not in ALLOWED_COUNTRIES:
-        return False
-
     return True
+
+
+def seller_country(session, item_url):
+    """Va lire la vraie fiche de l'annonce pour trouver le pays du vendeur.
+    Renvoie None si l'info n'a pas pu être confirmée (l'annonce sera alors écartée)."""
+    try:
+        r = session.get(item_url, timeout=20)
+        if r.status_code != 200:
+            return None
+        html = r.text
+    except Exception:
+        return None
+
+    m = re.search(r'"country_code"\s*:\s*"([A-Z]{2})"', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'"country_iso_code"\s*:\s*"([A-Z]{2})"', html)
+    if m:
+        return m.group(1)
+    return None
 
 
 s = cr.Session(impersonate="chrome")
@@ -194,7 +189,7 @@ except Exception:
     print("📁 Aucun historique trouvé, on part de zéro.")
 
 first_run = len(seen) == 0
-to_send = []
+candidates = []
 
 for query in SEARCHES:
     try:
@@ -231,12 +226,27 @@ for query in SEARCHES:
             continue
 
         label, max_price = match
-        if is_ok(ad, max_price):
-            to_send.append((ad, label, max_price))
+        if passes_basic_filters(ad, max_price):
+            candidates.append((ad, label, max_price))
         else:
             seen.add(ad_id)
 
     time.sleep(random.uniform(1, 2))
+
+print(f"🕵️ {len(candidates)} annonce(s) candidate(s), vérification du pays du vendeur...")
+
+to_send = []
+for ad, label, max_price in candidates:
+    ad_id = str(ad.get("id"))
+    country = seller_country(s, url_of(ad))
+    print(f"   → annonce {ad_id} ({label}) : pays détecté = {country}")
+
+    if country is None or country not in ALLOWED_COUNTRIES:
+        seen.add(ad_id)
+        continue
+
+    to_send.append((ad, label, max_price, country))
+    time.sleep(random.uniform(0.6, 1.2))
 
 print(f"📲 {len(to_send)} annonce(s) à envoyer.")
 
@@ -244,17 +254,16 @@ if first_run and to_send:
     tg(f"✅ Bot Cartes Graphiques Vinted actif. {len(to_send)} annonces trouvées, envoi en cours.")
 
 sent = 0
-for ad, label, max_price in to_send:
+for ad, label, max_price, country in to_send:
     ad_id = str(ad.get("id"))
     title = ad.get("title", "Sans titre")
     p = price_of(ad)
     favs = favs_of(ad)
-    c = country_of(ad)
 
     msg = (
         f"🎮 [{label}]\n{title}\n"
         f"💶 {p if p is not None else '?'} € (max {max_price} €)\n"
-        f"❤️ {favs} favoris" + (f"  🌍 {c}" if c else "") + "\n"
+        f"❤️ {favs} favoris  🌍 {country}\n"
         f"{url_of(ad)}"
     )
 
